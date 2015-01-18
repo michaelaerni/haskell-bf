@@ -3,100 +3,118 @@
   )
 where
 
-import Data.IORef
 import Data.Char
-import System.IO
+import NavSeq
 
--- Interprets a brainf**k program given its code and the memory cell count
-interpretCode :: String -> Int -> IO ()
-interpretCode code memsize = do
-  -- Disable console IO buffering to avoid deadlocks
-  hSetBuffering stdin NoBuffering
-  hSetBuffering stdout NoBuffering
 
-  -- Clean the code
-  let cleanedCode = cleanupCode code
-
-  -- Initialize the memory and interpret the code
-  initMemory memsize >>= \mem -> interpretInstruction $ ExecutionState 0 0 mem [] cleanedCode
+-- Interprets a brainf**k program given its code and the user input
+interpretCode :: String -> String -> String
+interpretCode code input = interpretInstruction startState where
+  startState = ExecutionState cleanedCode initialMemory [] input ""
+  cleanedCode = createSeq $ cleanupCode code
+  initialMemory = createSeq [0]
 
 
 -- Contains all data associated with the current state of execution
+type Memory = NavSeq Int
+type Code = NavSeq Char
 data ExecutionState = ExecutionState {
-  ip :: Int,
-  dp :: Int,
-  mem :: [IORef Int],
+  code :: Code,
+  mem :: Memory,
   stack :: [Int],
-  code :: String
+  input :: String,
+  output :: String -- Output is stored in reversed order as output is always just appended
   }
 
 
-interpretInstruction :: ExecutionState -> IO ()
-interpretInstruction state@(ExecutionState ip dp mem stack code) = case code !!? ip of
-  Nothing  -> return () -- All code is executed
-  Just '+' -> incrementMemory (mem !! dp) >> interpretInstruction (ExecutionState (ip + 1) dp mem stack code)
-  Just '-' -> decrementMemory (mem !! dp) >> interpretInstruction (ExecutionState (ip + 1) dp mem stack code)
-  Just '>' -> interpretInstruction $ ExecutionState (ip + 1) (dp + 1) mem stack code
-  Just '<' -> interpretInstruction $ ExecutionState (ip + 1) (dp - 1) mem stack code
-  Just '.' -> writeChar (mem !! dp) >> interpretInstruction (ExecutionState (ip + 1) dp mem stack code)
-  Just ',' -> readChar (mem !! dp) >> interpretInstruction (ExecutionState (ip + 1) dp mem stack code)
-  Just '[' -> handleWhileChar state >>= \newState -> interpretInstruction newState
-  Just ']' -> interpretInstruction $ ExecutionState (head stack) dp mem (tail stack) code
-  Just _   -> interpretInstruction $ ExecutionState (ip + 1) dp mem stack code -- Non-language character, is ignored
+interpretInstruction :: ExecutionState -> String
+interpretInstruction state = case (isRightEnd.code) state of
+  True -> (reverse.output) state
+  otherwise -> case (current.code) state of
+    '+' -> interpretInstruction $ handlePlus state
+    '-' -> interpretInstruction $ handleMinus state
+    '>' -> interpretInstruction $ handleMemRight state
+    '<' -> interpretInstruction $ handleMemLeft state
+    '.' -> interpretInstruction $ handlePoint state
+    ',' -> interpretInstruction $ handleComma state
+    '[' -> interpretInstruction $ handleOpenLoop state
+    ']' -> interpretInstruction $ handleCloseLoop state
+    _   -> interpretInstruction $ handleComment state
 
-readChar :: IORef Int -> IO ()
-readChar ref = do
-  char <- getChar
-  writeIORef ref $ ord char
 
-writeChar :: IORef Int -> IO ()
-writeChar ref = do
-  char <- readIORef ref
-  putStr $ chr char : []
+handlePlus :: ExecutionState -> ExecutionState
+handlePlus (ExecutionState code mem stack input output) = ExecutionState (moveRight code) (incrementMemory mem) stack input output
 
-incrementMemory :: IORef Int -> IO ()
+handleMinus :: ExecutionState -> ExecutionState
+handleMinus (ExecutionState code mem stack input output) = ExecutionState (moveRight code) (decrementMemory mem) stack input output
+
+handleMemRight :: ExecutionState -> ExecutionState
+handleMemRight (ExecutionState code mem stack input output) =
+  let newMem = moveRight mem in
+  case isRightEnd newMem of
+    -- Extend memory to the right if necessary
+    True -> ExecutionState (moveRight code) (appendRight 0 newMem) stack input output
+    otherwise -> ExecutionState (moveRight code) newMem stack input output
+
+handleMemLeft :: ExecutionState -> ExecutionState
+handleMemLeft (ExecutionState code mem stack input output) =
+  case isLeftEnd mem of
+    True -> error "Negative memory pointer index"
+    otherwise -> ExecutionState (moveRight code) (moveLeft mem) stack input output
+
+handlePoint :: ExecutionState -> ExecutionState
+handlePoint (ExecutionState code mem stack input output) = ExecutionState (moveRight code) mem stack input newOutput where
+  newOutput = (chr $ current mem) : output
+
+handleComma :: ExecutionState -> ExecutionState
+handleComma (ExecutionState _ _ _ [] _) = error "Input is read but no input is available anymore"
+handleComma (ExecutionState code mem stack (char:input) output) = ExecutionState (moveRight code) (insert (ord char) mem) stack input output
+
+handleComment :: ExecutionState -> ExecutionState
+handleComment (ExecutionState code mem stack input output) = ExecutionState (moveRight code) mem stack input output
+
+handleOpenLoop :: ExecutionState -> ExecutionState
+handleOpenLoop (ExecutionState code mem stack input output) =
+  let closingOffset = matchBracket code in
+  if (current mem) == 0
+  then ExecutionState (moveRightMany (closingOffset + 1) code) mem stack input output
+  else ExecutionState (moveRight code) mem (closingOffset : stack) input output
+
+handleCloseLoop :: ExecutionState -> ExecutionState
+handleCloseLoop (ExecutionState _ _ [] _ _) = error "Closing loop character found but no open loop on the stack anymore"
+handleCloseLoop (ExecutionState code mem (offset:stack) input output) = ExecutionState (moveLeftMany offset code) mem stack input output
+
+
+incrementMemory :: Memory -> Memory
 incrementMemory = addToMemory 1
 
-decrementMemory :: IORef Int -> IO ()
+decrementMemory :: Memory -> Memory
 decrementMemory = addToMemory (-1)
 
-addToMemory :: Int -> IORef Int -> IO ()
-addToMemory val ref = do
-  old <- readIORef ref
-  writeIORef ref $ old + val
+addToMemory :: Int -> Memory -> Memory
+addToMemory val mem = insert (current mem + val) mem
 
--- Initializes a fixed amount of IORefs acting as memory cells
-initMemory :: Int -> IO [IORef Int]
-initMemory cnt = initMemory' cnt $ return [] where
-  initMemory' 0 refs = refs
-  initMemory' cnt refs = do
-    ref <- newIORef 0
-    initMemory' (cnt - 1) $ refs >>= \rs -> return $ ref : rs
 
-handleWhileChar :: ExecutionState -> IO ExecutionState
-handleWhileChar (ExecutionState ip dp mem stack code) = do
-  let closingIndex = matchBracket ip code
-  currentVal <- readIORef (head $ drop dp mem)
-  return $ if currentVal == 0
-           then ExecutionState (closingIndex + 1) dp mem stack code
-           else ExecutionState (ip + 1) dp mem (ip : stack) code
+matchBracket :: Code -> Int
+matchBracket code = matchBracket' (moveRight code) 1 1 where
+  matchBracket' code open offset
+    | open == 0 = offset - 1
+    | isRightEnd code = error "No maching ] for ["
+    | current code == '[' = matchBracket' (moveRight code) (open + 1) (offset + 1)
+    | current code == ']' = matchBracket' (moveRight code) (open - 1) (offset + 1)
+    | otherwise = matchBracket' (moveRight code) open (offset + 1)
 
-matchBracket :: Int -> String -> Int
-matchBracket currentIp code = matchBracket' 1 1 $ drop (currentIp + 1) code where
-  matchBracket' ip 0 _ = currentIp + ip - 1
-  matchBracket' _ _ [] = error "No matching ']' for '['"
-  matchBracket' ip open ('[':code) = matchBracket' (ip + 1) (open + 1) code
-  matchBracket' ip open (']':code) = matchBracket' (ip + 1) (open - 1) code
-  matchBracket' ip open (c:code) = matchBracket' (ip + 1) open code
 
--- Safe !! Operator
-(!!?) :: [a] -> Int -> Maybe a
-(!!?) xs i = case drop i xs of
-  [] -> Nothing
-  xs -> Just $ head xs
+applyMany :: Int -> (a -> a) -> a -> a
+applyMany c f x = foldr (\f acc -> f acc) x $ replicate c f
 
--- List of interpretable characters
-interpretableChars = ['+', '-', '>', '<', '.', ',', '[', ']']
+moveRightMany :: Int -> NavSeq a -> NavSeq a
+moveRightMany count = applyMany count moveRight
+
+moveLeftMany :: Int -> NavSeq a -> NavSeq a
+moveLeftMany count = applyMany count moveLeft
+
 
 cleanupCode :: String -> String
-cleanupCode = filter (`elem` interpretableChars) 
+cleanupCode = filter (`elem` interpretableChars) where
+  interpretableChars = ['+', '-', '>', '<', '.', ',', '[', ']']

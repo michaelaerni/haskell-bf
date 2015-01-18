@@ -1,18 +1,17 @@
 import Brainfuck
-import Safe
 import System.Environment
 
-handleArgs :: [String] -> Maybe (String, Int)
-handleArgs (path:memsize:_) = case (readMay memsize) of
-  Nothing -> Nothing
-  Just size -> Just (path, size)
+handleArgs :: [String] -> Maybe (String, String)
+handleArgs [path, input] = Just (path, input)
 handleArgs _ = Nothing
 
-interpretFile :: String -> Int -> IO ()
-interpretFile path memsize = readFile path >>= \code -> interpretCode code memsize
+interpretFile :: String -> String -> IO String
+interpretFile path input = do
+  code <- readFile path
+  return $ interpretCode code input
 
 main = do
   args <- getArgs
   case handleArgs args of
-    Nothing -> putStrLn "Usage: haskell-bf [source] [memsize]"
-    Just (file, memsize) -> interpretFile file memsize
+    Nothing -> putStrLn "Usage: haskell-bf [source] [input]"
+    Just (file, input) -> interpretFile file input >>= putStr
